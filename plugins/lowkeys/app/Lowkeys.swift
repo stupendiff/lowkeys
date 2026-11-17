@@ -261,6 +261,7 @@ final class Relay: NSObject, WKScriptMessageHandler {
 
 final class Lowkeys: NSObject, NSApplicationDelegate {
     let paper = NSColor(red: 0xf3 / 255.0, green: 0xee / 255.0, blue: 0xe3 / 255.0, alpha: 1)
+    let nightPaper = NSColor(red: 0x1b / 255.0, green: 0x19 / 255.0, blue: 0x17 / 255.0, alpha: 1)
     var statusItem: NSStatusItem!
     var cfg = Config.load()
     let sounds = Sounds()
@@ -283,6 +284,17 @@ final class Lowkeys: NSObject, NSApplicationDelegate {
     var hotKeyHandler: EventHandlerRef?
     var peekTimer: Timer?
     var peeking = false
+
+    // The shelf (⌘O): the list of pages, then one of them to read.
+    enum Mode { case writing, list, reading }
+    var mode = Mode.writing
+    var shelfAll: [Shelved] = []
+    var shelf: [Shelved] = []       // the ones that match what has been typed
+    var shelfQuery = ""
+    var shelfAt = 0
+    var shelfText = ""              // the page being read
+    var keysShown = false
+    var board = NSPasteboard.general
 
     var selfTest: SelfTest?
 
@@ -376,11 +388,40 @@ final class Lowkeys: NSObject, NSApplicationDelegate {
         try? FileManager.default.createDirectory(at: cfg.saveDir, withIntermediateDirectories: true)
         NSWorkspace.shared.open(cfg.saveDir)
     }
-    @objc func menuSounds() {
+    @objc func menuSounds() { setSounds(!cfg.sounds) }
+
+    func setSounds(_ on: Bool) {
         var j = readJSON(Paths.config)
-        j["sounds"] = !cfg.sounds
+        j["sounds"] = on
         writeJSON(j, to: Paths.config)
         cfg = Config.load()
+        sounds.on = cfg.sounds
+    }
+
+    /// ⌘D: light paper or dark. Kept between sittings.
+    var dark: Bool { (readJSON(Paths.state)["theme"] as? String) == "dark" }
+
+    func toggleTheme() {
+        var j = readJSON(Paths.state)
+        j["theme"] = dark ? "light" : "dark"
+        writeJSON(j, to: Paths.state)
+        win?.backgroundColor = dark ? nightPaper : paper
+        web?.underPageBackgroundColor = dark ? nightPaper : paper
+        call("lk.theme(\(js(dark ? "dark" : "light")))")
+    }
+
+    /// How big the type is, as a multiple of the usual size. Kept between sittings.
+    var typeSize: Double {
+        max(0.7, min(1.6, readJSON(Paths.state)["zoom"] as? Double ?? 1))
+    }
+
+    func setTypeSize(_ z: Double) {
+        let to = (max(0.7, min(1.6, z)) * 10).rounded() / 10
+        var j = readJSON(Paths.state)
+        j["zoom"] = to
+        writeJSON(j, to: Paths.state)
+        call("lk.zoom(\(to))")
+        call("lk.note(\(js("type \(Int((to * 100).rounded()))%")))")
     }
     @objc func quit() {
         if win != nil { closePage { NSApp.terminate(nil) } } else { NSApp.terminate(nil) }
@@ -446,18 +487,21 @@ final class Lowkeys: NSObject, NSApplicationDelegate {
         let w = PageWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         w.level = level
         w.isReleasedWhenClosed = false
-        w.backgroundColor = paper
+        w.backgroundColor = dark ? nightPaper : paper
         w.collectionBehavior = [.fullScreenAuxiliary, .moveToActiveSpace]
         w.acceptsMouseMovedEvents = false
 
         let wc = WKWebViewConfiguration()
         wc.userContentController.add(Relay(self), name: "lk")
-        let payload: [String: Any] = ["config": cfg.forPage, "text": text, "gen": gen]
+        var forPage = cfg.forPage
+        forPage["zoom"] = typeSize
+        forPage["theme"] = dark ? "dark" : "light"
+        let payload: [String: Any] = ["config": forPage, "text": text, "gen": gen]
         let json = (try? JSONSerialization.data(withJSONObject: payload)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
         wc.userContentController.addUserScript(WKUserScript(
             source: "window.__LK = \(json);", injectionTime: .atDocumentStart, forMainFrameOnly: true))
         let v = WKWebView(frame: NSRect(origin: .zero, size: screen.frame.size), configuration: wc)
-        v.underPageBackgroundColor = paper
+        v.underPageBackgroundColor = dark ? nightPaper : paper
         v.autoresizingMask = [.width, .height]
         v.loadFileURL(Paths.resources.appendingPathComponent("web/page.html"), allowingReadAccessTo: Paths.resources)
         w.contentView = v
@@ -482,12 +526,15 @@ final class Lowkeys: NSObject, NSApplicationDelegate {
         FileManager.default.createFile(atPath: Paths.lock.path, contents: nil)
 
         monitor = NSEvent.addLocalMonitorForEvents(matching: [
-            .keyDown, .flagsChanged, .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+            .keyDown, .keyUp, .flagsChanged, .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
             .otherMouseDown, .otherMouseUp, .leftMouseDragged, .rightMouseDragged, .scrollWheel,
         ]) { [weak self] ev in
             guard let self = self, self.win != nil else { return ev }
             switch ev.type {
             case .keyDown: self.keyDown(ev); return nil
+            case .keyUp:
+                if Int(ev.keyCode) == kVK_ANSI_Slash { self.showKeys(false) }
+                return nil
             case .flagsChanged: self.flagsChanged(ev); return ev
             default: return nil          // the mouse does nothing here
             }
@@ -516,15 +563,27 @@ final class Lowkeys: NSObject, NSApplicationDelegate {
         stopPeek()
         let mods = ev.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if mods.contains(.command) {
-            switch (ev.charactersIgnoringModifiers ?? "").lowercased() {
-            case "s": saveNow()
-            case "p": printPDF()
-            case "n": newPage()
+            let k = (ev.charactersIgnoringModifiers ?? "").lowercased()
+            if k != "/" && k != "?" { showKeys(false) }
+            switch k {
             case "q", "w": closePage(nil)
+            case "o": if mode == .writing { openShelf() } else { closeShelf() }
+            case "n": if mode == .writing { newPage() } else { newFromShelf() }
+            case "s" where mode == .writing: saveNow()
+            case "p": if mode == .writing { printPDF() } else { printChosen() }
+            case "c": copyPage()
+            case "m": toggleSounds()
+            case "d": toggleTheme()
+            case "=", "+": setTypeSize(typeSize + 0.1)
+            case "-", "_": setTypeSize(typeSize - 0.1)
+            case "0": setTypeSize(1)
+            case "/", "?": showKeys(true)
             default: break
             }
             return
         }
+        showKeys(false)
+        if mode != .writing { shelfKey(ev); return }
         switch Int(ev.keyCode) {
         case kVK_Escape: closePage(nil); return
         case kVK_Return, kVK_ANSI_KeypadEnter:
@@ -535,20 +594,57 @@ final class Lowkeys: NSObject, NSApplicationDelegate {
             sounds.play("space"); call("lk.type('    ')"); return
         default: break
         }
-        if mods.contains(.control) { return }
-        // Letters only: no control codes, no arrow or function keys.
-        let typed = String(String.UnicodeScalarView((ev.characters ?? "").unicodeScalars.filter {
-            $0.value >= 0x20 && $0.value != 0x7F && !(0xF700...0xF8FF).contains($0.value)
-        }))
+        let typed = printable(ev)
         guard !typed.isEmpty else { return }
         sounds.play(typed == " " ? "space" : "key")
         call("lk.type(\(js(typed)))")
     }
 
+    /// Letters only: no control codes, no arrow or function keys.
+    func printable(_ ev: NSEvent) -> String {
+        if ev.modifierFlags.contains(.control) { return "" }
+        return String(String.UnicodeScalarView((ev.characters ?? "").unicodeScalars.filter {
+            $0.value >= 0x20 && $0.value != 0x7F && !(0xF700...0xF8FF).contains($0.value)
+        }))
+    }
+
+    /// ⌘/ shows every key on the page for as long as it is held.
+    func showKeys(_ on: Bool) {
+        guard on != keysShown else { return }
+        keysShown = on
+        call("lk.keys(\(on))")
+    }
+
+    func toggleSounds() {
+        setSounds(!cfg.sounds)
+        sounds.play("key")
+        call("lk.note(\(js(cfg.sounds ? "sounds on" : "sounds off")))")
+    }
+
+    /// ⌘C: the clean text of the page on the paper, or of the one chosen on the shelf.
+    func copyPage() {
+        let put: (String) -> Void = { [weak self] text in
+            guard let self = self else { return }
+            if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                self.call("lk.note('nothing to copy yet')")
+                return
+            }
+            self.board.clearContents()
+            self.board.setString(text, forType: .string)
+            self.call("lk.note('copied')")
+        }
+        if mode == .writing {
+            pullText { [weak self] text in self?.lastText = text; put(text) }
+        } else if let page = chosen() {
+            put(page.text)
+        }
+    }
+
     /// Holding Option by itself for a moment shows the count; letting go hides it.
     func flagsChanged(_ ev: NSEvent) {
         let mods = ev.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        if mods == .option {
+        if !mods.contains(.command) { showKeys(false) }
+        if mods == .option && mode == .writing {
             peekTimer?.invalidate()
             peekTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { [weak self] _ in
                 self?.peeking = true
@@ -672,6 +768,169 @@ final class Lowkeys: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: The shelf
+
+    struct Shelved {
+        let url: URL
+        let when: String
+        let text: String            // as saved, without the final newline
+        let lower: String
+        let first: String
+        let words: Int
+    }
+
+    /// Every page in the writing folder, most recently written first.
+    func pages() -> [Shelved] {
+        let files = (try? FileManager.default.contentsOfDirectory(at: cfg.saveDir,
+            includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles])) ?? []
+        var found: [(url: URL, when: Date, text: String)] = []
+        for f in files where f.pathExtension.lowercased() == "md" {
+            guard var t = try? String(contentsOf: f, encoding: .utf8) else { continue }
+            if t.hasSuffix("\n") { t.removeLast() }
+            let when = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            found.append((f, when ?? .distantPast, t))
+        }
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("dMMMyyyyjmm")
+        return found.sorted { $0.when > $1.when }.prefix(300).map { p in
+            let words = p.text.split(whereSeparator: { $0.isWhitespace })
+            return Shelved(url: p.url, when: f.string(from: p.when), text: p.text, lower: p.text.lowercased(),
+                first: String(words.prefix(14).joined(separator: " ").prefix(60)), words: words.count)
+        }
+    }
+
+    func chosen() -> Shelved? { shelf.indices.contains(shelfAt) ? shelf[shelfAt] : nil }
+
+    func forgetShelf() { shelfAll = []; shelf = []; shelfQuery = "" }
+
+    func openShelf() {
+        // Save first, so the page on the paper is in the list as it stands.
+        pullText { [weak self] text in
+            guard let self = self, self.win != nil, !self.closing, self.mode == .writing else { return }
+            self.lastText = text
+            self.save(text)
+            let found = self.pages()
+            guard !found.isEmpty else { self.call("lk.note('nothing written yet')"); return }
+            self.shelfAll = found
+            self.shelf = found
+            self.shelfQuery = ""
+            let here = self.pagePath?.standardizedFileURL.path
+            self.shelfAt = found.firstIndex(where: { $0.url.standardizedFileURL.path == here }) ?? 0
+            self.mode = .list
+            self.drawShelf()
+        }
+    }
+
+    func drawShelf() {
+        let rows: [[String: Any]] = shelf.map { ["when": $0.when, "first": $0.first, "words": $0.words] }
+        let json = (try? JSONSerialization.data(withJSONObject: rows))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        call("lk.shelf(\(json), \(shelfAt), \(js(shelfQuery)))")
+    }
+
+    /// Typing on the shelf keeps only the pages that hold every word typed.
+    func refilter() {
+        let was = chosen()?.url
+        let terms = shelfQuery.lowercased().split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        shelf = terms.isEmpty ? shelfAll : shelfAll.filter { p in terms.allSatisfy { p.lower.contains($0) } }
+        shelfAt = shelf.firstIndex(where: { $0.url == was }) ?? 0
+        drawShelf()
+    }
+
+    func closeShelf() {
+        mode = .writing
+        forgetShelf()
+        call("lk.shelfClose()")
+    }
+
+    /// ⌘N from the shelf. The page on the paper was saved when the shelf opened.
+    func newFromShelf() {
+        mode = .writing
+        forgetShelf()
+        newPage()
+    }
+
+    func moveShelf(to i: Int) {
+        guard !shelf.isEmpty else { return }
+        let to = max(0, min(shelf.count - 1, i))
+        guard to != shelfAt else { return }
+        shelfAt = to
+        sounds.play("space")
+        call("lk.shelfSelect(\(to))")
+    }
+
+    func shelfKey(_ ev: NSEvent) {
+        let code = Int(ev.keyCode)
+        if mode == .reading {
+            switch code {
+            case kVK_UpArrow: call("lk.readScroll('up')")
+            case kVK_DownArrow: call("lk.readScroll('down')")
+            case kVK_PageUp: call("lk.readScroll('pgup')")
+            case kVK_PageDown, kVK_Space: call("lk.readScroll('pgdn')")
+            case kVK_Home: call("lk.readScroll('home')")
+            case kVK_End: call("lk.readScroll('end')")
+            case kVK_Return, kVK_ANSI_KeypadEnter: writeOnChosen()
+            case kVK_Escape, kVK_LeftArrow: mode = .list; call("lk.readClose()")
+            default: break
+            }
+            return
+        }
+        switch code {
+        case kVK_UpArrow: moveShelf(to: shelfAt - 1)
+        case kVK_DownArrow: moveShelf(to: shelfAt + 1)
+        case kVK_PageUp: moveShelf(to: shelfAt - 6)
+        case kVK_PageDown: moveShelf(to: shelfAt + 6)
+        case kVK_Home: moveShelf(to: 0)
+        case kVK_End: moveShelf(to: shelf.count - 1)
+        case kVK_Return, kVK_ANSI_KeypadEnter, kVK_RightArrow: readChosen()
+        case kVK_Escape:
+            // First Esc clears what was typed; the next one leaves the shelf.
+            if shelfQuery.isEmpty { closeShelf() } else { shelfQuery = ""; refilter() }
+        case kVK_Delete:
+            if !shelfQuery.isEmpty { shelfQuery.removeLast(); sounds.play("strike"); refilter() }
+        default:
+            let typed = printable(ev)
+            guard !typed.isEmpty, shelfQuery.count < 40 else { return }
+            shelfQuery += typed
+            sounds.play(typed == " " ? "space" : "key")
+            refilter()
+        }
+    }
+
+    func readChosen() {
+        guard let page = chosen() else { return }
+        shelfText = page.text
+        mode = .reading
+        sounds.play("key")
+        call("lk.read(\(js(page.when)), \(js(page.text)))")
+    }
+
+    /// ⌘P on the shelf: a PDF of the chosen page, beside its text file.
+    func printChosen() {
+        guard let page = chosen() else { return }
+        let pdf = page.url.deletingPathExtension().appendingPathExtension("pdf")
+        let ok = writePDF(page.text, to: pdf)
+        call("lk.note(\(js(ok ? "pdf saved" : "could not make the pdf")))")
+    }
+
+    /// Return while reading: that page goes on the paper, to carry on writing.
+    func writeOnChosen() {
+        guard let page = chosen() else { return }
+        if page.url.standardizedFileURL.path == pagePath?.standardizedFileURL.path { closeShelf(); return }
+        // The page on the paper was saved when the shelf opened and no key has
+        // reached it since; this is a no-op unless that save failed.
+        save(lastText)
+        gen += 1
+        pagePath = page.url
+        written = page.text
+        lastText = page.text
+        setOpenPage(page.url)
+        mode = .writing
+        forgetShelf()
+        sounds.play("return")
+        call("lk.open(\(js(page.text)), \(gen))")
+    }
+
     // MARK: Closing
 
     @objc func wentInactive() {
@@ -700,6 +959,7 @@ final class Lowkeys: NSObject, NSApplicationDelegate {
         blanks.forEach { $0.orderOut(nil) }
         blanks = []
         win = nil; web = nil
+        mode = .writing; forgetShelf(); keysShown = false
         try? FileManager.default.removeItem(at: Paths.lock)
         closing = false
         // Hand the keyboard back to whatever was in front before.
@@ -768,7 +1028,7 @@ final class SelfTest {
         report["hotkey_registered"] = app.hotKeyRef != nil
         app.onReady = { [weak self] in self?.after(0.5) { self?.typed() } }
         after(0.3) { self.app.openPage() }
-        after(20) { self.finish("timed out") }
+        after(45) { self.finish("timed out") }
     }
 
     func typed() {
@@ -836,16 +1096,103 @@ final class SelfTest {
         app.onReady = { [weak self] in
             guard let self = self else { return }
             self.after(0.4) {
-                self.typeOut("Back again.") {
-                    self.key("\u{1B}", code: kVK_Escape)
-                    self.after(0.6) {
-                        self.report["resumed_text"] = (self.app.pagePath.flatMap { try? String(contentsOf: $0, encoding: .utf8) }) ?? ""
-                        self.finish("ok")
+                self.typeOut("Back again.") { self.shelf() }
+            }
+        }
+        app.openPage()
+    }
+
+    func textOf(_ url: URL?) -> String {
+        (url.flatMap { try? String(contentsOf: $0, encoding: .utf8) }) ?? ""
+    }
+
+    /// ⌘O: the list, find a page by its words, read it, PDF and copy it, write on.
+    func shelf() {
+        let second = app.pagePath
+        let first = URL(fileURLWithPath: report["file"] as? String ?? "")
+        app.board = NSPasteboard(name: NSPasteboard.Name("com.stupendiff.lowkeys.selftest"))
+        key("o", code: kVK_ANSI_O, flags: .command)
+        after(0.7) {
+            self.report["shelf_rows"] = self.app.shelf.count
+            self.report["shelf_starts_on_open_page"] = self.app.chosen()?.url.path == second?.path
+            self.report["second_saved_before_shelf"] = self.textOf(second)
+            self.typeOut("zzz") {
+                self.report["find_no_match"] = self.app.shelf.isEmpty
+                self.key("\u{1B}", code: kVK_Escape)        // clears the search, stays on the shelf
+                self.typeOut("Quiet bell") {
+                    self.report["find_one"] = self.app.mode == .list && self.app.shelf.count == 1
+                        && self.app.chosen()?.url.path == first.path
+                    self.shot("4-shelf.png") {
+                        self.key("\r", code: kVK_Return)
+                        self.after(0.5) { self.reading(first, second) }
                     }
                 }
             }
         }
-        app.openPage()
+    }
+
+    func reading(_ first: URL, _ second: URL?) {
+        report["reading"] = app.mode == .reading
+        let pdf = first.deletingPathExtension().appendingPathExtension("pdf")
+        try? FileManager.default.removeItem(at: pdf)
+        key("p", code: kVK_ANSI_P, flags: .command)
+        key("c", code: kVK_ANSI_C, flags: .command)
+        after(1.0) {
+            self.report["pdf_from_reading"] = FileManager.default.fileExists(atPath: pdf.path)
+            self.report["copied_from_reading"] = self.app.board.string(forType: .string) == self.app.shelfText
+            self.shot("5-read.png") {
+                self.key("\r", code: kVK_Return)
+                self.after(0.5) { self.afterShelf(first, second) }
+            }
+        }
+    }
+
+    func afterShelf(_ first: URL, _ second: URL?) {
+        report["writing_first_again"] = app.mode == .writing && app.pagePath?.path == first.path
+        typeOut("And more. cat \u{8}s wrold\u{8}\u{8}\u{8}\u{8}\u{8}\u{8}") {
+            self.key("c", code: kVK_ANSI_C, flags: .command)
+            self.key("=", code: kVK_ANSI_Equal, flags: .command)
+            self.key("m", code: kVK_ANSI_M, flags: .command)
+            self.key("d", code: kVK_ANSI_D, flags: .command)
+            self.after(0.7) {
+                self.report["copied_from_writing"] = self.app.board.string(forType: .string) ?? ""
+                self.report["size_after_plus"] = self.app.typeSize
+                self.report["sounds_after_m"] = self.app.cfg.sounds
+                self.report["dark_after_d"] = self.app.dark
+                self.shot("6-bigger.png") {
+                    self.key("0", code: kVK_ANSI_0, flags: .command)
+                    self.key("m", code: kVK_ANSI_M, flags: .command)
+                    self.key("/", code: kVK_ANSI_Slash, flags: .command)
+                    self.after(0.7) {
+                        self.report["dark_at_keys"] = self.app.dark
+                        self.report["size_after_zero"] = self.app.typeSize
+                        self.report["sounds_after_m_again"] = self.app.cfg.sounds
+                        self.report["keys_shown"] = self.app.keysShown
+                        self.shot("7-keys.png") { self.newFromShelf(first, second) }
+                    }
+                }
+            }
+        }
+    }
+
+    func newFromShelf(_ first: URL, _ second: URL?) {
+        app.showKeys(false)
+        key("o", code: kVK_ANSI_O, flags: .command)
+        after(0.6) {
+            self.shot("8-shelf-dark.png") {}
+            self.key("d", code: kVK_ANSI_D, flags: .command)
+            self.key("n", code: kVK_ANSI_N, flags: .command)
+            self.after(0.6) {
+                self.report["new_from_shelf"] = self.app.mode == .writing && self.app.pagePath == nil
+                self.report["dark_at_end"] = self.app.dark
+                self.key("\u{1B}", code: kVK_Escape)
+                self.after(0.6) {
+                    self.report["first_after_shelf"] = self.textOf(first)
+                    self.report["resumed_text"] = self.textOf(second)
+                    self.finish("ok")
+                }
+            }
+        }
     }
 
     var done = false

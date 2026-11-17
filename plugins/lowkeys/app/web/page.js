@@ -21,6 +21,8 @@
   var statsEl = document.getElementById('stats');
   var probe = document.getElementById('probe');
 
+  if (cfg.theme) document.documentElement.dataset.theme = cfg.theme;
+  if (cfg.zoom) document.documentElement.style.setProperty('--zoom', cfg.zoom);
   if (cfg.font) {
     document.documentElement.style.setProperty(
       '--font', '"' + String(cfg.font).replace(/["\\]/g, '') + '", "Courier Prime", "Courier", monospace');
@@ -54,7 +56,8 @@
     var el = document.createElement('span');
     el.className = fresh ? 'c new' : 'c';
     el.textContent = ch.c;
-    if (ch.c !== ' ') {
+    if (ch.c === ' ') el.classList.add('sp');
+    else {
       el.style.setProperty('--o', (0.8 + Math.random() * 0.2).toFixed(2));
       el.style.setProperty('--dy', (Math.random() * 1.2 - 0.6).toFixed(2) + 'px');
       el.style.setProperty('--r', (Math.random() * 1.2 - 0.6).toFixed(2) + 'deg');
@@ -172,9 +175,127 @@
     statsEl.textContent = parts.join('  ·  ');
   }
 
+  // ---- the shelf (⌘O) --------------------------------------------------
+  // The app decides what the keys mean while it is open and keeps track of
+  // which row is chosen; this only draws.
+
+  var shelfEl = document.getElementById('shelf');
+  var rowsEl = document.getElementById('rows');
+  var readIn = document.getElementById('read-in');
+  var readTitle = document.getElementById('read-title');
+  var readText = document.getElementById('read-text');
+  var hintEl = document.getElementById('hint');
+  var findEl = document.getElementById('find');
+  var keysEl = document.getElementById('keys');
+  var ROW_FADE = [1, 0.5, 0.36, 0.25, 0.16, 0.1, 0.06];
+  var LIST_HINT = 'arrows  choose   ·   type  to find   ·   return  read   ·   esc  back';
+  var READ_HINT = 'arrows  scroll   ·   return  write on   ·   esc  back';
+  var shelfSel = 0, readY = 0;
+
+  function cell(cls, text) {
+    var el = document.createElement('span');
+    el.className = cls;
+    el.textContent = text;
+    return el;
+  }
+
+  function placeRows(still) {
+    var rows = rowsEl.children;
+    if (!rows.length) return;
+    for (var i = 0; i < rows.length; i++) {
+      var d = Math.abs(i - shelfSel);
+      rows[i].classList.toggle('sel', d === 0);
+      rows[i].style.opacity = d < ROW_FADE.length ? ROW_FADE[d] : 0;
+    }
+    var h = rows[0].getBoundingClientRect().height;
+    var y = window.innerHeight * 0.46 - (shelfSel + 0.5) * h;
+    rowsEl.style.transition = still ? 'none' : '';
+    rowsEl.style.transform = 'translateY(' + y.toFixed(2) + 'px)';
+    if (still) { void rowsEl.offsetWidth; rowsEl.style.transition = ''; }
+  }
+
+  function placeRead(still) {
+    var most = Math.max(0, readIn.offsetHeight - window.innerHeight);
+    readY = Math.max(0, Math.min(most, readY));
+    readIn.style.transition = still ? 'none' : '';
+    readIn.style.transform = 'translateY(' + (-readY).toFixed(2) + 'px)';
+    if (still) { void readIn.offsetWidth; readIn.style.transition = ''; }
+  }
+
+  function closeShelf() {
+    shelfEl.classList.remove('on', 'reading');
+  }
+
   // ---- the app's way in -------------------------------------------------
 
   window.lk = {
+    // rows: [{when, first, words}], newest first.
+    shelf: function (rows, sel, query) {
+      rowsEl.textContent = '';
+      findEl.textContent = query ? 'find: ' + query : '';
+      if (!rows.length) {
+        var none = document.createElement('div');
+        none.className = 'row';
+        none.appendChild(cell('mark', ''));
+        none.appendChild(cell('when', ''));
+        none.appendChild(cell('first', 'no page has those words'));
+        rowsEl.appendChild(none);
+      }
+      for (var i = 0; i < rows.length; i++) {
+        var r = rows[i], el = document.createElement('div');
+        el.className = 'row';
+        el.appendChild(cell('mark', '>'));
+        el.appendChild(cell('when', r.when));
+        el.appendChild(cell('first', r.first));
+        el.appendChild(cell('words', r.words + (r.words === 1 ? ' word' : ' words')));
+        rowsEl.appendChild(el);
+      }
+      shelfSel = sel || 0;
+      hintEl.textContent = LIST_HINT;
+      noteEl.classList.remove('on');
+      shelfEl.classList.remove('reading');
+      shelfEl.classList.add('on');
+      placeRows(true);
+    },
+    shelfSelect: function (i) { shelfSel = i; placeRows(false); },
+    read: function (title, text) {
+      readTitle.textContent = title;
+      readText.textContent = '';
+      var paras = String(text).split('\n');
+      for (var i = 0; i < paras.length; i++) {
+        var p = document.createElement('p');
+        p.textContent = paras[i];
+        readText.appendChild(p);
+      }
+      hintEl.textContent = READ_HINT;
+      shelfEl.classList.add('reading');
+      readY = 0;
+      placeRead(true);
+    },
+    readScroll: function (how) {
+      var line = parseFloat(getComputedStyle(readIn).lineHeight) || 30;
+      var page = window.innerHeight * 0.7;
+      if (how === 'up') readY -= line * 3;
+      else if (how === 'down') readY += line * 3;
+      else if (how === 'pgup') readY -= page;
+      else if (how === 'pgdn') readY += page;
+      else if (how === 'home') readY = 0;
+      else if (how === 'end') readY = Infinity;
+      placeRead(false);
+    },
+    readClose: function () {
+      hintEl.textContent = LIST_HINT;
+      shelfEl.classList.remove('reading');
+      placeRows(true);
+    },
+    shelfClose: closeShelf,
+    // Puts another page on the paper to carry on writing it.
+    open: function (text, newGen) {
+      clearTimeout(saveTimer); saveTimer = null;
+      if (newGen) gen = newGen;
+      start(text);
+      closeShelf();
+    },
     type: function (text) {
       cursorLine = state.lines.length - 1;
       var returned = apply(M.type(state, text));
@@ -189,8 +310,11 @@
       var cur = state.lines.length - 1;
       var i = M.strike(state);
       if (i < 0) return false;
-      lineEls[cur].children[i].classList.add('struck');
-      post({ t: 'sound', n: 'strike' });
+      var el = lineEls[cur].children[i];
+      el.classList.add('struck');
+      // A space has no ink to strike: it is taken back and the gap closes.
+      post({ t: 'sound', n: el.classList.contains('sp') ? 'space' : 'strike' });
+      place('type');
       changed(false, true);
       return true;
     },
@@ -200,6 +324,7 @@
       if (!hit.length) return false;
       for (var k = 0; k < hit.length; k++) lineEls[cur].children[hit[k]].classList.add('struck');
       post({ t: 'sound', n: 'strike' });
+      place('type');
       changed(false, true);
       return true;
     },
@@ -210,13 +335,24 @@
       clearTimeout(saveTimer); saveTimer = null;
       if (newGen) gen = newGen;
       start('');
+      closeShelf();
       return old;
     },
     note: function (msg) {
       noteEl.textContent = msg;
       noteEl.classList.add('on');
+      shelfEl.classList.add('quiet');     // the hint sits in the same place
       clearTimeout(noteTimer);
-      noteTimer = setTimeout(function () { noteEl.classList.remove('on'); }, 1400);
+      noteTimer = setTimeout(function () {
+        noteEl.classList.remove('on');
+        shelfEl.classList.remove('quiet');
+      }, 1400);
+    },
+    theme: function (name) { document.documentElement.dataset.theme = name; },
+    keys: function (on) { keysEl.classList.toggle('on', !!on); },
+    zoom: function (z) {
+      document.documentElement.style.setProperty('--zoom', z);
+      rebuild(); placeRows(true); placeRead(true);
     },
     peek: function (on) {
       peeking = !!on;
@@ -225,7 +361,7 @@
     }
   };
 
-  window.addEventListener('resize', function () { rebuild(); });
+  window.addEventListener('resize', function () { rebuild(); placeRows(true); placeRead(true); });
   window.addEventListener('contextmenu', function (e) { e.preventDefault(); });
   window.addEventListener('dragstart', function (e) { e.preventDefault(); });
 

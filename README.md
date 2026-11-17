@@ -34,9 +34,15 @@ Then run `/lowkeys:setup`. It asks where to save your writing, which hotkey you 
 | ⌘S | Save now |
 | ⌘P | Write a PDF beside the text file |
 | ⌘N | Put this page away and start a clean one |
-| ⌫ | Strike the last letter |
+| ⌘O | Your pages, newest first. ↑ ↓ to choose, or type a few words to find the pages that hold them. Return reads one, Return again carries on writing it, Esc steps back. ⌘P, ⌘C and ⌘N work here too, on the chosen page. |
+| ⌘C | Copy the whole page, without the struck letters |
+| ⌫ | Strike the last letter. A space isn't struck: it is taken back and the gap closes. |
 | ⌥⌫ | Strike the last word |
 | Hold ⌥ | Show the word count and minutes until you let go |
+| ⌘M | Sounds on or off |
+| ⌘D | Light or dark paper. Remembered. |
+| ⌘+ / ⌘− / ⌘0 | Bigger, smaller, usual type. Remembered. |
+| Hold ⌘/ | Show all of these keys on the page |
 
 Switching to another app also closes the page (saved). Opening Lowkeys again picks up the page you left, until ⌘N starts a new one. Right-click the **k** for New page, Show writing folder, Sounds and Quit.
 
@@ -92,7 +98,6 @@ The bundled sounds are synthesized by `tools/make_sounds.py`, so the repo carrie
 
 - Accents typed with dead keys (⌥E then E) and non-Latin input methods. Lowkeys reads raw keys; that is also what keeps paste and dictation out.
 - Backspace across lines. Once the carriage has returned, that line is on the paper.
-- Dark mode. It is paper.
 
 ## Development
 
