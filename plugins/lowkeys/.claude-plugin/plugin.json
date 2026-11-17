@@ -1,0 +1,9 @@
+{
+  "name": "lowkeys",
+  "version": "0.1.0",
+  "description": "A typewriter writing mode in your Mac's menu bar. One click or a hotkey and the screen is paper: the line slides under a fixed typing point, keys click, a bell rings at the margin, and backspace strikes a letter out instead of erasing it. Keyboard only. Saves a clean text file as you type and prints a PDF. Commands: /lowkeys:setup, open, remove.",
+  "author": { "name": "stupendiff" },
+  "homepage": "https://github.com/stupendiff/lowkeys",
+  "repository": "https://github.com/stupendiff/lowkeys",
+  "keywords": ["writing", "typewriter", "focus", "macos", "desktop"]
+}

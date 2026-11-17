@@ -1,0 +1,12 @@
+{
+  "name": "lowkeys",
+  "owner": { "name": "stupendiff" },
+  "description": "A typewriter writing mode for your Mac, set up by Claude.",
+  "plugins": [
+    {
+      "name": "lowkeys",
+      "source": "./plugins/lowkeys",
+      "description": "A typewriter writing mode in your Mac's menu bar: paper, key sounds, a margin bell, and backspace that strikes out instead of erasing."
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "description": "Keeps the installed Lowkeys app on the same version as the plugin. Silent unless it updated something, and it waits if the page is open.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/lowkeys.py\" sync --quiet 2>/dev/null || true",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}
